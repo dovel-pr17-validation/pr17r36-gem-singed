@@ -1,0 +1,247 @@
+# typed: strict
+# frozen_string_literal: true
+
+require "shellwords"
+require "tmpdir"
+require "optionparser"
+
+# NOTE: we defer requiring singed until we run. that lets Rails load it if its in the gemfile, so the railtie has had a chance to run
+
+module Singed
+  class CLI
+    #: Array[String]
+    attr_accessor :argv
+
+    #: Pathname?
+    attr_accessor :filename
+
+    #: OptionParser
+    attr_accessor :opts
+
+    #: (Array[String]) -> void
+    def initialize(argv)
+      @argv = argv
+      @opts = OptionParser.new #: OptionParser
+      @interrupted = false #: bool
+
+      parse_argv!
+    end
+
+    #: () -> void
+    def parse_argv!
+      opts.banner = "Usage: singed [options] <command>"
+
+      opts.on("-h", "--help", "Show this message") do
+        @show_help = true #: bool?
+      end
+
+      opts.on("-o", "--output-directory DIRECTORY", "Directory to write flamegraph to") do |directory|
+        @output_directory = directory #: String?
+      end
+
+      opts.on("-r", "--rate RATE", Integer, "Sample rate for rbspy") do |rate|
+        @rate = rate #: Integer?
+      end
+
+      opts.order(@argv) do |arg|
+        opts.terminate if arg == "--"
+        break
+      end
+
+      if @argv.empty?
+        @show_help = true
+        @error_message = "missing command to profile" #: (String | OptionParser::InvalidOption)?
+        return
+      end
+
+      return if @show_help
+
+      begin
+        @opts.parse!(argv)
+      rescue OptionParser::InvalidOption => e
+        @show_help = true
+        @error_message = e
+      end
+    end
+
+    #: () -> void
+    def run
+      require "singed"
+
+      if @error_message
+        puts @error_message
+        puts
+        puts @opts.help
+        exit 1
+      end
+
+      if show_help?
+        puts @opts.help
+        exit 0
+      end
+
+      Singed.output_directory = @output_directory if @output_directory
+      Singed.output_directory ||= Dir.tmpdir
+      # The ||= above has just set output_directory if it was unset.
+      FileUtils.mkdir_p(
+        Singed.output_directory #: as !nil
+      )
+      @filename = Singed::Flamegraph.generate_filename(label: "cli")
+
+      # nil values are for flags. rbspy uses its default rate unless one was given.
+      options = {
+        format: "speedscope",
+        file: filename.to_s,
+        silent: nil,
+      }
+      options[:rate] = @rate if @rate
+
+      rbspy_args = [
+        "record",
+        *options.map { |k, v| ["--#{k}", v].compact }.flatten,
+        "--",
+        *argv,
+      ]
+
+      loop do
+        break unless password_needed?
+
+        puts "🔥📈 Singed needs to run as root, but will drop permissions back to your user. Prompting with sudo now..."
+        prompt_password
+      end
+
+      rbspy = -> do
+        # don't run things with spring, because it forks and rbspy won't see it
+        sudo ["rbspy", *rbspy_args], reason: "Singed needs to run as root, but will drop permissions back to your user.", env: { "DISABLE_SPRING" => "1" }
+      end
+
+      if defined?(Bundler)
+        Bundler.with_unbundled_env do
+          rbspy.call
+        end
+      else
+        rbspy.call
+      end
+
+      # @filename rather than the nilable filename reader: Sorbet knows it holds a Pathname by now.
+      unless @filename.exist?
+        puts "#{filename} doesn't exist. Maybe rbspy had a failure capturing it? Check the scrollback."
+        exit 1
+      end
+
+      unless adjust_ownership!
+        puts "#{filename} isn't writable!"
+        exit 1
+      end
+
+      # clean the report, similar to how Singed::Report does
+      json = JSON.parse(@filename.read)
+      json["shared"]["frames"].each do |frame|
+        frame["file"] = Singed.filter_line(frame["file"])
+      end
+      @filename.write(JSON.dump(json))
+
+      flamegraph = Singed::Flamegraph.new(filename:)
+      flamegraph.open
+    end
+
+    #: () -> bool
+    def password_needed?
+      !system("sudo --non-interactive true >/dev/null 2>&1")
+    end
+
+    #: () -> bool?
+    def prompt_password
+      system("sudo true")
+    end
+
+    #: () -> bool
+    def adjust_ownership!
+      sudo ["chown", ENV["USER"], filename], reason: "Adjusting ownership of #{filename}, but need root."
+    end
+
+    #: () -> bool?
+    def show_help?
+      @show_help
+    end
+
+    # Never nil or false: a command that fails raises instead.
+    #: (Array[String | Integer | Pathname | nil], reason: String, ?env: Hash[String, String]) -> bool
+    def sudo(system_args, reason:, env: {})
+      loop do
+        break unless password_needed?
+
+        puts "🔥📈 #{reason} Prompting with sudo now..."
+        prompt_password
+      end
+
+      sudo_args = [
+        "sudo",
+        "--preserve-env",
+        *system_args.map(&:to_s),
+      ]
+
+      puts "$ #{Shellwords.join(sudo_args)}"
+
+      # Sorbet can't check a splat of an array of unknown length: https://srb.help/7019
+      process = Process #: as untyped
+      pid = process.spawn(env, *sudo_args) #: as Integer
+      status = wait_passing_on_signals(pid)
+      raise "#{Shellwords.join(sudo_args)} failed (#{status})" unless status.success?
+
+      true
+    end
+
+    # Kernel#system would leave the command running when singed is killed. Instead, the first SIGTERM is
+    # passed on as SIGINT, which sudo relays and is the only signal rbspy stops cleanly on, killing the
+    # command and writing the flamegraph. Nothing more is passed on, because rbspy exits without writing
+    # anything when interrupted twice, and Ctrl-C at a terminal already reaches it directly. Later SIGTERMs
+    # are ignored until singed exits, so they can't stop it opening the flamegraph either.
+    # https://github.com/rbspy/rbspy/blob/v0.53.0/src/main.rs#L164-L211
+    #: (Integer) -> Process::Status
+    def wait_passing_on_signals(pid)
+      previous_int = trap("INT", "IGNORE")
+      previous_term = trap("TERM") do
+        @interrupted ||= interrupt(pid)
+      end
+
+      # Process.wait2 only returns nil when told not to block.
+      waited = Process.wait2(pid) #: as !nil
+      waited.last
+    ensure
+      # trap returns nil for a handler installed outside Ruby, and restoring nil would ignore the signal.
+      trap("INT", previous_int || "DEFAULT")
+      trap("TERM", previous_term || "DEFAULT") unless @interrupted
+    end
+
+    # sudo before 1.9.13 doesn't relay a signal sent from its own process group, which singed shares to keep
+    # sudo in the terminal's foreground, so a kill in a group of its own sends it. kill fails while sudo
+    # briefly runs entirely as root, as it does starting up, and then a later SIGTERM tries again.
+    # https://github.com/sudo-project/sudo/commit/36742deec3041413af9b293706a64530321b96b5
+    #: (Integer) -> bool
+    def interrupt(pid)
+      kill = Process.spawn("kill", "-INT", pid.to_s, pgroup: true, err: File::NULL)
+      waited = Process.wait2(kill) #: as !nil
+      !!waited.last.success?
+    end
+
+    #: () -> String?
+    def self.chdir_rails_root
+      original_cwd = Dir.pwd
+
+      loop do
+        if File.file?("config/environment.rb")
+          return Dir.pwd
+        end
+
+        if Pathname.new(Dir.pwd).root?
+          Dir.chdir(original_cwd)
+          return
+        end
+
+        # Otherwise keep moving upwards in search of an executable.
+        Dir.chdir("..")
+      end
+    end
+  end
+end

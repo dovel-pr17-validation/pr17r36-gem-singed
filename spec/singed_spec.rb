@@ -1,0 +1,96 @@
+# typed: false
+# frozen_string_literal: true
+
+RSpec.describe Singed do
+  around do |example|
+    original_enabled = Singed.enabled?
+    example.run
+  ensure
+    Singed.enabled = original_enabled
+    Singed.instance_variable_set(:@current_flamegraph, nil)
+    Singed.instance_variable_set(:@profiler, nil)
+  end
+
+  describe ".profiler" do
+    it "is stackprof by default" do
+      expect(Singed.profiler).to eq(:stackprof)
+    end
+
+    it "can be vernier" do
+      Singed.profiler = :vernier
+
+      expect(Singed.profiler).to eq(:vernier)
+    end
+
+    it "rejects profilers Singed doesn't support" do
+      expect { Singed.profiler = :rbspy }.to raise_error(ArgumentError, /Unsupported profiler :rbspy/)
+      expect(Singed.profiler).to eq(:stackprof)
+    end
+  end
+
+  describe ".start" do
+    before { Singed.enabled = true }
+
+    it "creates a current flamegraph and starts profiling" do
+      current_flamegraph = Singed.start
+
+      expect(current_flamegraph).to be_a(Singed::Flamegraph)
+      expect(Singed.profiling?).to be true
+      expect(current_flamegraph.started?).to be true
+    end
+
+    it "does nothing when already profiling" do
+      Singed.start
+      expect(Singed.start).to be_nil
+    end
+
+    it "does nothing when disabled" do
+      Singed.enabled = false
+      expect(Singed.start).to be_nil
+      expect(Singed.profiling?).to be_falsey
+    end
+  end
+
+  describe ".stop" do
+    before do
+      Singed.enabled = true
+    end
+
+    it "returns nil when not profiling" do
+      expect(Singed.stop).to be_nil
+    end
+
+    it "stops profiling, saves the result file, and returns the flamegraph with profile data" do
+      Singed.start
+      # Run some code to generate profile samples
+      100.times { 2**10 }
+      flamegraph = Singed.stop
+
+      expect(flamegraph).to be_a(Singed::Flamegraph)
+      expect(Singed.profiling?).to be false
+
+      # Profile data is returned (StackProf results hash)
+      expect(flamegraph.profile).to be_a(Hash)
+      expect(flamegraph.profile).to include(:mode, :version, :interval)
+      expect(flamegraph.profile[:mode]).to eq(:wall)
+      expect(flamegraph.profile[:samples]).to be >= 0
+    end
+
+    it "creates the result file on disk" do
+      Singed.start
+      100.times { 2**10 }
+      flamegraph = Singed.stop
+
+      expect(Pathname(flamegraph.filename)).to exist
+    end
+
+    it "profiles with vernier when started with it" do
+      Singed.start(profiler: :vernier)
+      100.times { 2**10 }
+      flamegraph = Singed.stop
+
+      expect(flamegraph.profile).to be_a(Vernier::Result)
+      expect(JSON.parse(flamegraph.filename.read)).to include("$schema" => "https://www.speedscope.app/file-format-schema.json")
+    end
+  end
+end
